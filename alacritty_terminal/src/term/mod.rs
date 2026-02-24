@@ -47,6 +47,32 @@ pub const SEMANTIC_ESCAPE_CHARS: &str = ",│`|:\"' ()[]{}<>\t";
 /// Max size of the keyboard modes.
 const KEYBOARD_MODE_STACK_MAX_DEPTH: usize = TITLE_STACK_MAX_DEPTH;
 
+/// FinalTerm OSC 133 semantic marker type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Osc133Kind {
+    Prompt,
+    InputBegin,
+    OutputBegin,
+    CommandDone,
+}
+
+/// A captured OSC 133 marker annotated with the current cursor position.
+///
+/// The `stable_row` is an index from the top of the scrollback buffer (0-based) and is derived
+/// from `cursor.line + history_size` at the time the marker is parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Osc133Marker {
+    pub kind: Osc133Kind,
+    pub stable_row: i64,
+    pub column: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct Osc133State {
+    generation: u64,
+    markers: Vec<Osc133Marker>,
+}
+
 /// Default tab interval, corresponding to terminfo `it` value.
 const INITIAL_TABSTOPS: usize = 8;
 
@@ -327,6 +353,9 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// Captured OSC 133 markers (best-effort).
+    osc133: Osc133State,
 }
 
 /// Configuration options for the [`Term`].
@@ -428,6 +457,7 @@ impl<T> Term<T> {
             event_proxy,
             damage,
             config,
+            osc133: Osc133State::default(),
             grid,
             tabs,
             inactive_keyboard_mode_stack: Default::default(),
@@ -442,6 +472,27 @@ impl<T> Term<T> {
             title: Default::default(),
             mode: Default::default(),
         }
+    }
+
+    /// Access captured OSC 133 markers.
+    #[inline]
+    pub fn osc133_markers(&self) -> &[Osc133Marker] {
+        &self.osc133.markers
+    }
+
+    /// Marker generation counter.
+    ///
+    /// This is incremented when the terminal clears/resets state in a way that invalidates
+    /// previously captured markers.
+    #[inline]
+    pub fn osc133_generation(&self) -> u64 {
+        self.osc133.generation
+    }
+
+    #[inline]
+    fn reset_osc133(&mut self) {
+        self.osc133.generation = self.osc133.generation.wrapping_add(1);
+        self.osc133.markers.clear();
     }
 
     /// Collect the information about the changes in the lines, which
@@ -1057,6 +1108,44 @@ impl<T> Dimensions for Term<T> {
 }
 
 impl<T: EventListener> Handler for Term<T> {
+    fn osc133(&mut self, params: &[&[u8]]) {
+        if params.is_empty() {
+            return;
+        }
+
+        // Ignore semantic markers in ALT_SCREEN TUIs; they are typically absent and storing them
+        // would just create confusing/invalid ranges.
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+
+        let kind = match params[0].first().copied() {
+            Some(b'P') => Osc133Kind::Prompt,
+            Some(b'B') => Osc133Kind::InputBegin,
+            Some(b'C') => Osc133Kind::OutputBegin,
+            Some(b'D') => Osc133Kind::CommandDone,
+            _ => return,
+        };
+
+        // Convert to a stable index from the top of scrollback:
+        // topmost_line == -history_size, so stable == line - topmost_line == line + history_size.
+        let stable_row = self.grid.cursor.point.line.0 as i64 + self.history_size() as i64;
+        let column = self.grid.cursor.point.column.0;
+
+        self.osc133.markers.push(Osc133Marker {
+            kind,
+            stable_row,
+            column,
+        });
+
+        // Keep memory usage bounded for extremely chatty sessions.
+        const MAX_MARKERS: usize = 50_000;
+        if self.osc133.markers.len() > MAX_MARKERS {
+            let keep = MAX_MARKERS / 2;
+            self.osc133.markers.drain(..self.osc133.markers.len().saturating_sub(keep));
+        }
+    }
+
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
@@ -1814,6 +1903,12 @@ impl<T: EventListener> Handler for Term<T> {
             ansi::ClearMode::Saved => (),
         }
 
+        // `clear`-style operations rewrite the viewport/history in-place; invalidate any captured
+        // semantic markers which are keyed by stable scrollback positions.
+        if matches!(mode, ansi::ClearMode::All | ansi::ClearMode::Saved) {
+            self.reset_osc133();
+        }
+
         self.mark_fully_damaged();
     }
 
@@ -1854,6 +1949,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.mode.insert(TermMode::default());
 
         self.event_proxy.send_event(Event::CursorBlinkingChange);
+        self.reset_osc133();
         self.mark_fully_damaged();
     }
 
